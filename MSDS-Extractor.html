@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Inventory Scanner — XLSX barcode match (ID + Location)</title>
+
+<!-- Local libraries (put these files next to this HTML)
+     If you prefer CDN, replace with:
+     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+     <script src="https://cdn.jsdelivr.net/npm/xlsx@0.20.2/dist/xlsx.full.min.js"></script>
+-->
+<script src="jszip.min.js"></script>
+<script src="xlsx.full.min.js"></script>
+
+<style>
+:root { --bg:#0b0f1a; --fg:#eee; --muted:#9aa4c2; --accent:#7aa2ff; --card:#0e1324; --line:#2b3250; }
+* { box-sizing:border-box; }
+body { background:var(--bg); color:var(--fg); font-family:system-ui,Segoe UI,Roboto,Ubuntu,sans-serif; margin:0; }
+.wrap { max-width:1200px; margin:0 auto; padding:18px 12px 40px; }
+h1 { margin:0 0 8px; text-align:center; }
+.small { color:var(--muted); font-size:12px; text-align:center; }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0; }
+.btn { background:#222; border:1px solid #555; color:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; }
+.btn:hover { background:#2b2b2b; }
+select, input[type="text"] { background:#0f1426; color:#fff; border:1px solid #444; border-radius:8px; padding:8px 10px; }
+input[type="file"] { color:#ddd; }
+.grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; margin-top:12px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; }
+.card h3 { margin:0 0 8px; font-size:16px; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+th, td { border:1px solid #444; padding:6px 8px; text-align:left; }
+th { background:#1b1f2f; position:sticky; top:0; z-index:1; }
+.kpi { display:flex; gap:10px; justify-content:center; margin-top:8px; }
+.kpi .box { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 10px; min-width:140px; text-align:center; }
+.kpi .big { font-size:22px; font-weight:700; }
+#scanInput { width:100%; }
+#diagnostics { margin-top:6px; color:var(--muted); text-align:center; font-size:12px; }
+.log { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px; white-space:pre-wrap; font-size:12px; margin-top:10px; }
+.badge { background:#2b3250; color:#cfe; padding:2px 6px; border-radius:999px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Inventory Scanner — barcode match (XLSX)</h1>
+  <p class="small">1) Import your <b>.xlsx</b> (must contain a <b>barcode</b> column). 2) Scan labels with a USB scanner or paste codes — no need to press Enter.</p>
+
+  <div class="row">
+    <input id="fileInput" type="file" accept=".xlsx,.xlsb,.xls" />
+    <button id="resetBtn" class="btn">Reset</button>
+    <span class="small" id="headerTip" style="flex:1 1 auto; overflow:auto;"></span>
+  </div>
+
+  <div class="row">
+    <label class="small">Identifier column:</label>
+    <select id="idColumn"></select>
+    <span class="small" id="idLockMsg" style="display:none;">(locked on <b>barcode</b>)</span>
+    <span class="small" id="idWarnMsg" style="display:none;">(no “barcode” header found — using selection)</span>
+  </div>
+
+  <input id="scanInput" type="text" placeholder="Scan or paste codes (auto-commit). Separate many with comma, space or line breaks..." />
+
+  <div class="kpi">
+    <div class="box">
+      <div class="small">Total registered</div>
+      <div class="big" id="kpiTotal">0</div>
+    </div>
+    <div class="box">
+      <div class="small">Present (scanned & registered)</div>
+      <div class="big" id="kpiPresent">0</div>
+    </div>
+    <div class="box">
+      <div class="small">Missing (registered but not scanned)</div>
+      <div class="big" id="kpiMissing">0</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Present <span class="badge" id="presentCount">0</span></h3>
+      <table id="tblPresent">
+        <thead>
+          <tr><th>barcode</th><th>Id *</th><th>Location (cntn_id)</th><th>Time</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="row" style="justify-content:flex-end;margin-top:8px;">
+        <button id="exportPresent" class="btn">Export CSV</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Missing (registered but not scanned) <span class="badge" id="missingCount">0</span></h3>
+      <table id="tblMissing">
+        <thead>
+          <tr><th>barcode</th><th>Id *</th><th>Location (cntn_id)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="row" style="justify-content:flex-end;margin-top:8px;">
+        <button id="exportMissing" class="btn">Export CSV</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="diagnostics" class="small">Diagnostics: XLSX loaded=<span id="xlOk">false</span></div>
+  <div id="log" class="log"></div>
+</div>
+
+<script>
+/* ---------------- State ---------------- */
+let rowsRaw = [];
+let headers = [];
+let idKey = '';
+const expectedMap = new Map(); // code -> row
+const expectedSet = new Set();
+const present = new Map();     // code -> { time, id, location }
+
+/* ---------------- Utils ---------------- */
+function log(msg){
+  const el = document.getElementById('log');
+  el.textContent += (el.textContent ? "\n" : "") + msg;
+  el.scrollTop = el.scrollHeight;
+}
+function nowTime(){
+  const d = new Date();
+  return d.toLocaleTimeString();
+}
+function normalizeCode(v){
+  return String(v || '').trim();
+}
+function toCSV(rows, cols){
+  let out = cols.join(',') + '\n';
+  rows.forEach(r=>{
+    const line = cols.map(c => String(r[c] ?? '').replace(/"/g,'""'));
+    out += '"' + line.join('","') + '"\n';
+  });
+  return out;
+}
+function downloadText(filename, text){
+  const blob = new Blob([text], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+/* ---------------- XLSX reader (robust header detection) ---------------- */
+async function readXLSX(file){
+  if(!window.XLSX) throw new Error('XLSX library not loaded');
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type:'array' });
+  const wsName = wb.SheetNames[0];
+  const ws = wb.Sheets[wsName];
+
+  const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:'', raw:false });
+
+  // find header row in first 20 lines
+  let headerRowIdx = 0, bestScore = -1;
+  const maxProbe = Math.min(rows.length, 20);
+  for (let i=0;i<maxProbe;i++){
+    const r = rows[i] || [];
+    const filled = r.filter(v => String(v).trim() !== '').length;
+    const hasBarcode = r.some(v => String(v).trim().toLowerCase() === 'barcode');
+    const score = filled + (hasBarcode ? 1000 : 0);
+    if (score > bestScore) { bestScore = score; headerRowIdx = i; }
+  }
+
+  let hdrs = (rows[headerRowIdx] || []).map(h => String(h || '').trim());
+  if (!hdrs.length) throw new Error('No header row detected');
+
+  // unique & tidy headers
+  const seen = new Map();
+  hdrs = hdrs.map((h, idx) => {
+    let name = h || `COL_${idx+1}`;
+    name = name.replace(/\s+/g,' ').trim();
+    if(!name) name = `COL_${idx+1}`;
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      const n = seen.get(key)+1; seen.set(key, n);
+      name = `${name}_${n}`;
+    } else {
+      seen.set(key,1);
+    }
+    return name;
+  });
+
+  const dataRows = rows.slice(headerRowIdx+1);
+  const data = [];
+  for(const r of dataRows){
+    if(!r || r.every(v => String(v).trim()==='')) continue;
+    const obj = {};
+    hdrs.forEach((h,i)=> obj[h] = r[i] ?? '');
+    data.push(obj);
+  }
+  return { sheetName: wsName, rows: data, headers: hdrs, headerRowIdx };
+}
+
+/* ---------------- Build index ---------------- */
+function rebuildIndex(){
+  const idSel = document.getElementById('idColumn');
+  idSel.innerHTML = '';
+  headers.forEach(h=>{
+    const opt = document.createElement('option');
+    opt.value = h; opt.textContent = h;
+    idSel.appendChild(opt);
+  });
+
+  // prefer 'barcode'
+  const idxBarcode = headers.findIndex(h => h.toLowerCase() === 'barcode');
+  if (idxBarcode >= 0){
+    idKey = headers[idxBarcode];
+    idSel.selectedIndex = idxBarcode;
+    idSel.disabled = true;
+    document.getElementById('idLockMsg').style.display='inline';
+    document.getElementById('idWarnMsg').style.display='none';
+  } else {
+    idSel.disabled = false;
+    if(!idKey) idKey = headers[0] || '';
+    idSel.value = idKey;
+    document.getElementById('idLockMsg').style.display='none';
+    document.getElementById('idWarnMsg').style.display='inline';
+  }
+
+  expectedMap.clear(); expectedSet.clear();
+  for(const row of rowsRaw){
+    const code = normalizeCode(row[idKey]);
+    if(!code) continue;
+    if(expectedMap.has(code)) continue;
+    expectedMap.set(code, row);
+    expectedSet.add(code);
+  }
+
+  document.getElementById('kpiTotal').textContent = expectedSet.size;
+  refreshTables();
+}
+
+/* ---------------- Tables render ---------------- */
+function refreshTables(){
+  // Present table rows
+  const t1 = document.querySelector('#tblPresent tbody');
+  t1.innerHTML = '';
+  const presRows = [];
+  present.forEach((v, code)=>{
+    presRows.push({ barcode: code, id: v.id, location: v.location, time: v.time });
+  });
+  presRows.sort((a,b)=> a.time.localeCompare(b.time));
+  presRows.forEach(r=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.barcode}</td><td>${r.id||''}</td><td>${r.location||''}</td><td>${r.time}</td>`;
+    t1.appendChild(tr);
+  });
+
+  // Missing = expected but not present
+  const t2 = document.querySelector('#tblMissing tbody');
+  t2.innerHTML = '';
+  const missRows = [];
+  expectedSet.forEach(code=>{
+    if(!present.has(code)){
+      const row = expectedMap.get(code) || {};
+      const idCol = findIdColumnName(row);
+      const locCol = findLocationColumnName(row);
+      missRows.push({
+        barcode: code,
+        id: String(row[idCol] ?? ''),
+        location: String(row[locCol] ?? '')
+      });
+    }
+  });
+  missRows.sort((a,b)=> a.barcode.localeCompare(b.barcode));
+  missRows.forEach(r=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.barcode}</td><td>${r.id}</td><td>${r.location}</td>`;
+    t2.appendChild(tr);
+  });
+
+  document.getElementById('presentCount').textContent = presRows.length;
+  document.getElementById('missingCount').textContent = missRows.length;
+  document.getElementById('kpiPresent').textContent = presRows.length;
+  document.getElementById('kpiMissing').textContent = missRows.length;
+
+  // export handlers
+  document.getElementById('exportPresent').onclick = ()=>{
+    const csv = toCSV(presRows, ['barcode','id','location','time']);
+    downloadText('present.csv', csv);
+  };
+  document.getElementById('exportMissing').onclick = ()=>{
+    const csv = toCSV(missRows, ['barcode','id','location']);
+    downloadText('missing.csv', csv);
+  };
+}
+
+/* Helpers to find 'Id *' and 'Location (cntn_id)' even if casing/spaces differ */
+function findIdColumnName(row){
+  if (!row) return 'Id *';
+  const keys = Object.keys(row);
+  let col = keys.find(k => k.trim().toLowerCase() === 'id *') ||
+            keys.find(k => k.trim().toLowerCase() === 'id*') ||
+            keys.find(k => k.trim().toLowerCase() === 'id');
+  return col || 'Id *';
+}
+function findLocationColumnName(row){
+  if (!row) return 'Location (cntn_id)';
+  const keys = Object.keys(row);
+  let col = keys.find(k => k.trim().toLowerCase() === 'location (cntn_id)') ||
+            keys.find(k => k.trim().toLowerCase() === 'location') ||
+            keys.find(k => k.toLowerCase().includes('location'));
+  return col || 'Location (cntn_id)';
+}
+
+/* ---------------- Scan handling (no Enter needed) ---------------- */
+function handleCodesInputText(txt){
+  // split by newline, comma, semicolon, space (one or many)
+  const parts = String(txt).split(/[\s,;]+/).map(s=>s.trim()).filter(Boolean);
+  parts.forEach(code => processScan(code));
+}
+
+function processScan(raw){
+  const code = normalizeCode(raw);
+  if(!code) return;
+  if(!expectedSet.size){ log('No XLSX loaded yet.'); return; }
+
+  if(expectedMap.has(code)){
+    // retrieve ID and Location from the row
+    const row = expectedMap.get(code);
+    const idCol = findIdColumnName(row);
+    const locCol = findLocationColumnName(row);
+    const idVal  = String(row[idCol] ?? '');
+    const locVal = String(row[locCol] ?? '');
+
+    present.set(code, { time: nowTime(), id: idVal, location: locVal });
+    log(`✔ Present: ${code}  |  Id: ${idVal}  |  Location: ${locVal}`);
+    refreshTables();
+  } else {
+    log(`✖ Not registered: ${code}`);
+  }
+}
+
+/* Debounced auto-commit: commit the buffer if no keystroke for 180ms */
+let typingTimer = null;
+let lastCommitted = '';
+const SCAN_DELAY = 180; // ms
+
+function attachScanInput(){
+  const el = document.getElementById('scanInput');
+  el.value = '';
+  el.addEventListener('input', ()=>{
+    if (typingTimer) clearTimeout(typingTimer);
+    typingTimer = setTimeout(()=>{
+      const txt = el.value;
+      if(!txt) return;
+      // if scanner already adds Enter/newline, or user pasted multiple — all handled
+      handleCodesInputText(txt);
+      el.value = '';       // clear for next scan
+      lastCommitted = txt; // (debug)
+    }, SCAN_DELAY);
+  });
+  // Also process immediate Enter (if scanner sends it)
+  el.addEventListener('keydown', (e)=>{
+    if (e.key === 'Enter'){
+      e.preventDefault();
+      const txt = el.value;
+      if(!txt) return;
+      handleCodesInputText(txt);
+      el.value = '';
+    }
+  });
+}
+
+/* ---------------- Wire up ---------------- */
+document.getElementById('xlOk').textContent = !!window.XLSX;
+
+document.getElementById('fileInput').addEventListener('change', async (e)=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  try{
+    const res = await readXLSX(f);
+    rowsRaw = res.rows;
+    headers = res.headers;
+
+    // show header names as a tiny tip
+    document.getElementById('headerTip').textContent =
+      'Headers: ' + headers.join(' | ');
+
+    rebuildIndex();
+    log(`Loaded XLSX: ${f.name} | rows=${rowsRaw.length} | headers=${headers.length}`);
+  }catch(err){
+    log('Failed to read XLSX: ' + (err && err.message ? err.message : err));
+  }
+});
+
+document.getElementById('idColumn').addEventListener('change', (e)=>{
+  idKey = e.target.value;
+  rebuildIndex();
+});
+
+document.getElementById('resetBtn').onclick = ()=>{
+  rowsRaw = []; headers = []; idKey = '';
+  expectedMap.clear(); expectedSet.clear(); present.clear();
+  document.getElementById('idColumn').innerHTML = '';
+  document.getElementById('scanInput').value = '';
+  document.getElementById('headerTip').textContent = '';
+  document.getElementById('kpiTotal').textContent = '0';
+  refreshTables();
+  log('State reset.');
+};
+
+attachScanInput();
+refreshTables();
+</script>
+</body>
+</html>
